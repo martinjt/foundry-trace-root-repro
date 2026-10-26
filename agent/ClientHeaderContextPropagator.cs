@@ -3,36 +3,35 @@ using System.Diagnostics;
 namespace FixedReplyAgent;
 
 /// <summary>
-/// Prefers <c>x-client-traceparent</c> / <c>x-client-tracestate</c> / <c>x-client-baggage</c> over the
-/// plain W3C headers when extracting the incoming request's trace context, falling back to
-/// <paramref name="inner"/> (the platform default) when they are absent or invalid. This is the
-/// extension point AgentHost's own telemetry setup uses for ASP.NET Core's server-span creation:
-/// <c>Azure.AI.AgentServer.Core.Internal.W3CBaggagePropagator</c> (shipped with the hosting package)
-/// reads <c>Activity.Current</c> set up from exactly this propagator, not from
-/// <c>Sdk.SetDefaultTextMapPropagator</c>, which the agent never touches. Only installed when
-/// <c>CLIENT_HEADER_PROPAGATION</c> is on.
+/// The propagator ASP.NET Core's hosting layer uses to parent each server span: a valid
+/// x-client-traceparent wins, falling back to <paramref name="inner"/> (the platform default)
+/// otherwise. Registered as a DI singleton, not assigned to <see cref="DistributedContextPropagator.Current"/>
+/// and not installed via <c>Sdk.SetDefaultTextMapPropagator</c>: checking the hosting library's source
+/// showed its server-span creation resolves the propagator from DI
+/// (<c>services.TryAddSingleton(DistributedContextPropagator.Current)</c>, captured once while
+/// <c>AgentHost.CreateBuilder</c> sets up its <c>WebApplication</c> builder, before application code
+/// runs), not by re-reading <c>.Current</c> per request.
+///
+/// On its own this parents the activity correctly but does not join the trace: OpenTelemetry's ASP.NET
+/// Core instrumentation performs a second, independent extraction via
+/// <c>Propagators.DefaultTextMapPropagator</c> (see <see cref="ClientHeaderTextMapPropagator"/>), and
+/// discards this activity in favour of a replacement if that second extraction disagrees with it. Both
+/// overrides have to apply the same rule -- via the shared <see cref="ClientHeaderTraceParent"/> parser
+/// -- for either to actually take effect.
 /// </summary>
 internal sealed class ClientHeaderContextPropagator(DistributedContextPropagator inner) : DistributedContextPropagator
 {
     public override IReadOnlyCollection<string> Fields => inner.Fields;
 
-    public override void Inject(Activity? activity, object? carrier, DistributedContextPropagator.PropagatorSetterCallback? setter) =>
+    public override void Inject(Activity? activity, object? carrier, PropagatorSetterCallback? setter) =>
         inner.Inject(activity, carrier, setter);
 
     public override void ExtractTraceIdAndState(
-        object? carrier, DistributedContextPropagator.PropagatorGetterCallback? getter, out string? traceId, out string? traceState)
+        object? carrier, PropagatorGetterCallback? getter, out string? traceId, out string? traceState)
     {
-        if (getter is null)
+        if (getter is not null &&
+            ClientHeaderTraceParent.TryParse(TraceParentValues(carrier, getter), TraceStateValue(carrier, getter), out traceId, out traceState, out _))
         {
-            inner.ExtractTraceIdAndState(carrier, getter, out traceId, out traceState);
-            return;
-        }
-
-        getter(carrier, "x-client-traceparent", out var clientTraceParent, out _);
-        if (!string.IsNullOrEmpty(clientTraceParent) && ActivityContext.TryParse(clientTraceParent, null, isRemote: true, out _))
-        {
-            traceId = clientTraceParent;
-            getter(carrier, "x-client-tracestate", out traceState, out _);
             return;
         }
 
@@ -40,18 +39,34 @@ internal sealed class ClientHeaderContextPropagator(DistributedContextPropagator
     }
 
     public override IEnumerable<KeyValuePair<string, string?>>? ExtractBaggage(
-        object? carrier, DistributedContextPropagator.PropagatorGetterCallback? getter)
+        object? carrier, PropagatorGetterCallback? getter)
     {
         if (getter is null)
         {
             return inner.ExtractBaggage(carrier, getter);
         }
 
-        getter(carrier, "x-client-baggage", out var clientBaggage, out _);
+        getter(carrier, ClientHeaderNames.Baggage, out var clientBaggage, out _);
         return string.IsNullOrEmpty(clientBaggage) ? inner.ExtractBaggage(carrier, getter) : ParseBaggage(clientBaggage);
     }
 
-    // Mirrors the hosting package's own W3CBaggagePropagator parsing, applied to x-client-baggage instead of baggage.
+    // ASP.NET Core's getter joins repeated header lines with a comma; traceparent never legitimately
+    // contains one, so splitting it back apart recovers whether the caller actually sent it twice.
+    private static IEnumerable<string>? TraceParentValues(object? carrier, PropagatorGetterCallback getter)
+    {
+        getter(carrier, ClientHeaderNames.TraceParent, out var fieldValue, out var fieldValues);
+        return fieldValues ?? fieldValue?.Split(',');
+    }
+
+    // Tracestate is already exactly what W3C combining wants by the time the getter joins repeated
+    // lines with a comma, so it is taken as-is rather than split apart.
+    private static IEnumerable<string>? TraceStateValue(object? carrier, PropagatorGetterCallback getter)
+    {
+        getter(carrier, ClientHeaderNames.TraceState, out var fieldValue, out var fieldValues);
+        return fieldValues ?? (fieldValue is null ? null : [fieldValue]);
+    }
+
+    // Mirrors the hosting package's own baggage parsing, applied to x-client-baggage instead of baggage.
     private static IEnumerable<KeyValuePair<string, string?>> ParseBaggage(string header)
     {
         foreach (var pair in header.Split(','))
