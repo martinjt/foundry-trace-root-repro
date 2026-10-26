@@ -19,6 +19,9 @@ param callerImage string = ''
 @description('Name of the hosted agent the caller invokes.')
 param agentName string = 'trace-repro'
 
+@description('Workaround switch (default off): writes/reads x-client-traceparent, x-client-tracestate and x-client-baggage, which the Foundry gateway forwards unchanged instead of rewriting. See README "Workaround: x-client-* headers".')
+param clientHeaderPropagation bool = false
+
 @secure()
 @description('Key the dashboard requires on OTLP requests, sent as the x-otlp-api-key header.')
 param otlpApiKey string
@@ -225,6 +228,7 @@ resource caller 'Microsoft.App/containerApps@2025-01-01' = if (!empty(callerImag
             { name: 'OTEL_EXPORTER_OTLP_ENDPOINT', value: 'https://${dashboard.properties.configuration.ingress.fqdn}' }
             { name: 'OTEL_EXPORTER_OTLP_PROTOCOL', value: 'http/protobuf' }
             { name: 'OTEL_EXPORTER_OTLP_HEADERS', secretRef: 'otlp-headers' }
+            { name: 'CLIENT_HEADER_PROPAGATION', value: string(clientHeaderPropagation) }
           ]
         }
       ]

@@ -117,6 +117,62 @@ To remove everything (the AIServices account is purged too, so its name is free 
 SUBSCRIPTION=<subscription-id> ./teardown.sh
 ```
 
+## Workaround: x-client-* headers
+
+The asks above still stand: this section is not a fix, it is what we tried after being told Foundry's hosted-agent runtime forwards `x-client-*`-prefixed headers unchanged, while it rewrites the plain `traceparent`. The idea: have the caller send its real parent twice, once as the plain `traceparent` (which the platform rewrites) and once as `x-client-traceparent` (which it should pass through), and have the agent prefer the second one when extracting its own context.
+
+It is a deploy-time switch, off by default: `clientHeaderPropagation bool = false` in `infra/main.bicep`, wired to a `CLIENT_HEADER_PROPAGATION` environment variable on both the caller container and the agent version. Deploy with it on:
+
+```bash
+CLIENT_HEADER_PROPAGATION=true SUBSCRIPTION=<subscription-id> ./deploy.sh
+```
+
+`deploy.sh` passes it through to the Bicep deployment and folds it into `agent/agent-version.json`'s `environment_variables` before creating the agent version, so both sides turn on together.
+
+**Caller side**, when on: `caller/ClientHeaderPropagator.cs` is a `TextMapPropagator` that wraps the default W3C one and additionally writes `x-client-traceparent` (plus `x-client-tracestate` and `x-client-baggage` when present), installed with `Sdk.SetDefaultTextMapPropagator`. A propagator, not an ad-hoc header or a span processor, so every outgoing call gets it automatically and consistently with how the SDK already injects context.
+
+**Agent side**, when on: `agent/ClientHeaderContextPropagator.cs` is a `DistributedContextPropagator` that prefers `x-client-traceparent`/`x-client-tracestate`/`x-client-baggage` when present and valid, falling back to the platform's default otherwise. Getting this registered in the right place took checking the hosting library's own source: `Sdk.SetDefaultTextMapPropagator` and `DistributedContextPropagator.Current` are both the *wrong* extension point here, because ASP.NET Core's hosting layer resolves the propagator for its own server-span creation from DI (`services.TryAddSingleton(DistributedContextPropagator.Current)`, captured once while `AgentHost.CreateBuilder` sets up its `WebApplication` builder, before application code runs), not by re-reading `.Current` per request. So the override is registered as a later DI singleton instead, which wins:
+
+```csharp
+builder.Services.AddSingleton<DistributedContextPropagator>(
+    new ClientHeaderContextPropagator(DistributedContextPropagator.Current));
+```
+
+Verified against a standalone (non-hosted) run of this exact binary: with both `traceparent` and `x-client-traceparent` sent with different span ids, the resulting server span's ParentId matched `x-client-traceparent`, not `traceparent`. `agent/ClientHeaderLink.cs` additionally adds a span link to whatever context the platform's own `traceparent` carried, whenever it differs from `x-client-traceparent`, using an `ActivityListener` on the `Microsoft.AspNetCore` source rather than a span processor, so it runs synchronously before the span is exported and needs no `TracerProviderBuilder` changes.
+
+The screenshots below are from a deployment with the switch on (agent version 10), trace `cc45a551132b819c96f3304cfcc7ca15`, same blurring convention as above.
+
+![The GET /ask trace with the switch on, showing the same orphaned top-level rows as the default repro](docs/images/06-xclient-trace-still-broken.png)
+
+*Same shape as the switch-off trace (see 01): `POST /responses` and both `GET /readiness` are still top-level rows, not nested under the caller's `POST`.*
+
+![Span details of the caller's POST with the switch on, showing SpanId a86b52eca4215d92](docs/images/07-xclient-caller-post-span.png)
+
+*The caller's `POST` has SpanId `a86b52eca4215d92` — this is what the agent's `POST /responses` should have as its ParentId.*
+
+![Span details of the agent's POST /responses with the switch on, with repro.x_client_headers_received outlined as x-client-traceparent](docs/images/08-xclient-headers-received.png)
+
+*Evidence the platform does forward `x-client-*` headers unchanged: the agent tags its own span with the names of the `x-client-*` headers it received (never values) — `repro.x_client_headers_received` reads `x-client-traceparent`. So the header the caller sent arrives at the container intact.*
+
+![Context section of the agent's POST /responses, with Source and ParentId outlined, ParentId still 15af1389853af627](docs/images/09-xclient-parentid-still-platform.png)
+
+*And yet ParentId is still `15af1389853af627`, not the caller's SpanId `a86b52eca4215d92`. This span is confirmed as ASP.NET Core's own request span (`Microsoft.AspNetCore` source) — exactly where the DI-registered `DistributedContextPropagator` override is correctly wired, and which does take effect in a standalone run of the same binary — but in the real hosted runtime its ParentId still matches the platform's own rewritten `traceparent`, not `x-client-traceparent`.
+
+![Links section of the agent's POST /responses, showing one link to span 15af138 with description referencing the platform's traceparent](docs/images/10-xclient-span-link.png)
+
+*The span link `ClientHeaderLink` adds, pointing at the context from the platform's `traceparent`. It points at the same span as the broken ParentId above, because here the two happen to be the same: the override did not change which parent the hosted runtime's server span actually used.*
+
+**Why, as best we can tell:** Foundry's hosted-agent containers run an always-on, platform-reserved tracing pipeline ("Agent365 Observability") alongside the application's own OpenTelemetry SDK — every span in this repo, including the ones above, carries `telemetry.sdk.name=A365ObservabilitySDK` or is otherwise shaped by it, and it is controlled by `FOUNDRY_AGENT365_TRACING_ENABLED`. We tried setting that to `false` through the Foundry REST API to test the theory directly and the agent-versions endpoint rejected it outright:
+
+```
+Environment variable 'FOUNDRY_AGENT365_TRACING_ENABLED' is reserved for platform use.
+All FOUNDRY_* and AGENT_* variables are reserved per container-image-spec.
+```
+
+So there is no supported way to disable or reconfigure that pipeline from application code or deploy-time config. Our reading is that this reserved pipeline, not the ASP.NET Core request pipeline our propagator override reaches, is what ultimately decides the exported `POST /responses` span's parent — which would explain why headers demonstrably arrive intact and the documented SDK extension point is demonstrably wired correctly (both shown above), while the join still does not happen. We cannot fully confirm this from outside the platform: the Agent365 pipeline's internals are not public. That gap is itself part of the ask — if `x-client-*` headers are meant as a caller-supplied override, the component that actually owns parenting in the hosted runtime needs to honor them too, not just the application's own ASP.NET Core pipeline.
+
+After testing, this repo's live deployment is redeployed with the switch back off, matching the default.
+
 ## Versions
 
 Run on 2026-10-25 in uksouth.
