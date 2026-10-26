@@ -8,8 +8,7 @@ namespace FixedReplyAgent;
 /// agrees. If they disagreed, OpenTelemetry's ASP.NET Core instrumentation would see its own extraction
 /// (via <see cref="ClientHeaderTextMapPropagator"/>) differ from the parent the hosting layer already
 /// gave the activity (via <see cref="ClientHeaderContextPropagator"/>) and would discard that activity,
-/// starting a replacement server span parented to its own extraction instead -- see the README's
-/// "Workaround" section for why that is what actually broke the join the first time around.
+/// starting a replacement server span parented to its own extraction instead.
 /// </summary>
 internal static class ClientHeaderTraceParent
 {

@@ -25,7 +25,10 @@ internal static class ClientHeaderLink
         ActivitySource.AddActivityListener(new ActivityListener
         {
             ShouldListenTo = source => source.Name == AspNetCoreSourceName,
-            Sample = (ref ActivityCreationOptions<ActivityContext> _) => ActivitySamplingResult.AllDataAndRecorded,
+            // PropagationData, not AllDataAndRecorded: this listener only needs ActivityStarted to add a
+            // link, and must not force every Microsoft.AspNetCore activity to be recorded -- that
+            // decision belongs to the distro's own sampler, via its own ActivityListener on this source.
+            Sample = (ref ActivityCreationOptions<ActivityContext> _) => ActivitySamplingResult.PropagationData,
             ActivityStarted = activity => AddPlatformLinkIfDifferent(activity, httpContextAccessor.HttpContext),
         });
 
