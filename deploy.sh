@@ -8,6 +8,8 @@ RESOURCE_GROUP="${RESOURCE_GROUP:-rg-foundry-root-repro}"
 LOCATION="${LOCATION:-uksouth}"
 AGENT_NAME="trace-repro"
 API_VERSION="v1"
+# Workaround switch (default off): see README "Workaround: x-client-* headers".
+CLIENT_HEADER_PROPAGATION="${CLIENT_HEADER_PROPAGATION:-false}"
 
 here="$(cd "$(dirname "$0")" && pwd)"
 secrets_file="$here/.repro.env"
@@ -46,6 +48,7 @@ deploy_infrastructure() {
     --parameters location="$LOCATION" agentName="$AGENT_NAME" callerImage="$caller_image" \
       deployerPrincipalId="$(az ad signed-in-user show --query id -o tsv)" \
       otlpApiKey="$OTLP_API_KEY" browserToken="$BROWSER_TOKEN" dashboardApiKey="$DASHBOARD_API_KEY" \
+      clientHeaderPropagation="$CLIENT_HEADER_PROPAGATION" \
     --query properties.outputs -o json
 }
 
@@ -62,7 +65,10 @@ build_image() {
 create_agent_version() {
   local image="$1" agents body created
   agents="$(output projectEndpoint)/agents"
-  body=$(jq --arg image "$image" '.definition.container_configuration.image = $image' "$here/agent/agent-version.json")
+  body=$(jq --arg image "$image" --arg clientHeaderPropagation "$CLIENT_HEADER_PROPAGATION" \
+    '.definition.container_configuration.image = $image
+     | .definition.environment_variables.CLIENT_HEADER_PROPAGATION = $clientHeaderPropagation' \
+    "$here/agent/agent-version.json")
   if foundry GET "$agents/$AGENT_NAME?api-version=$API_VERSION" >/dev/null 2>&1; then
     created=$(foundry POST "$agents/$AGENT_NAME/versions?api-version=$API_VERSION" "$body")
   else

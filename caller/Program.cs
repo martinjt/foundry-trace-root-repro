@@ -2,11 +2,22 @@ using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using Azure.Core;
 using Azure.Identity;
+using Caller;
+using OpenTelemetry;
+using OpenTelemetry.Context.Propagation;
 using OpenTelemetry.Trace;
 
 // Plain OpenTelemetry defaults: W3C trace context goes out on the HttpClient call to the agent,
 // and OTEL_EXPORTER_OTLP_* say where the spans go.
 var builder = WebApplication.CreateBuilder(args);
+
+// Workaround switch (default off, see README "Workaround: x-client-* headers"): also write the
+// outgoing context under x-client-traceparent/x-client-tracestate/x-client-baggage, which the
+// Foundry gateway forwards unchanged instead of rewriting.
+if (bool.TryParse(builder.Configuration["CLIENT_HEADER_PROPAGATION"], out var clientHeaderPropagation) && clientHeaderPropagation)
+{
+    Sdk.SetDefaultTextMapPropagator(new ClientHeaderPropagator(Propagators.DefaultTextMapPropagator));
+}
 
 builder.Services.AddOpenTelemetry()
     .WithTracing(tracing => tracing
